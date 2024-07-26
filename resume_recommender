@@ -1,0 +1,208 @@
+import pandas as pd
+import numpy as np
+import datetime
+import time
+import sqlalchemy
+import re
+import random
+import spacy
+import json
+import nltk
+from sqlalchemy import create_engine
+from cloudant.client import Cloudant
+from pandas import json_normalize 
+from bs4 import BeautifulSoup
+from nltk.corpus import stopwords
+from nltk.stem.wordnet import WordNetLemmatizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+def get_recommendation(job_id):
+    
+    #Import credentials to access data
+    produser = "ibm_cloud_1ea2c088_ae6e_4037_b959_58405921c9b6"
+    prodpass = "3af1b6a1e994fccfc5830b60eb1cd6eaa9888851fc24b2406aa4c95a2a6fd79c"
+    cloudant_apikey = 'jwYBqLobG-F3HaQCvFzSMQxWrLuOfE0eYnBKTRkGLK9z'
+    cloudant_url = 'https://apikey-v2-34e6qp32wq1ysrjxyoiir271dzkacjhllk1k1fwecid9:540265e00a87433eb15ef79740697f60@5de078e3-245d-4441-8b31-5e276956e227-bluemix.cloudantnosqldb.appdomain.cloud'
+    
+    #Import data regarding jobs, skills and employees
+    engine = create_engine('postgresql://'
+                            + produser 
+                            +':'
+                            + prodpass 
+                            +'@0541b373-b134-406f-9687-f94b85d5cb94.bqfh4fpt0vhjh7rs4ot0.databases.appdomain.cloud:30280/ibmclouddb')
+    
+    #Insert DF to Postgresql Table
+    connection_prod = engine.connect()
+
+    #Read data to pandas df
+    query_skills = 'select * from myhilite.skills'
+
+    skills = pd.read_sql(query_skills, connection_prod)
+
+    query_personal = 'select * from fact.personal'
+
+    personal = pd.read_sql(query_personal, connection_prod)
+    
+    #Importing data from Cloudant
+    client = Cloudant.iam(None, cloudant_apikey, 
+                        url= cloudant_url, 
+                        connect=True)
+    
+    #Convert ATS data into list
+    data_ats = []
+    
+    Connect = client['ats-prod']
+    
+    for document in Connect:
+        data_ats.append(document)
+        time.sleep(0.01)
+    
+    #Enter data into a DataFrame
+    ats_df = pd.DataFrame(data_ats)
+    
+    #Filter for Jobs
+    type_is_job = ats_df['type'] == 'Job'
+    jobs = ats_df[type_is_job]
+    
+    #Choose wanted columns
+    columns = ['_id', 'education', 'jobID', 'language', 'experience', 'status', 'title', 'categories', 'location','onBoardStart', 'employment', 'jobDesc', 'requirement', 'liveStart']
+    jobs = jobs[columns]
+    
+    #Convert jobDesc and requirement into string (parsing)
+    jobs['jobDesc'] = jobs[['jobDesc']].applymap(lambda text: BeautifulSoup(text, 'html.parser').get_text())
+    jobs['requirement'] = jobs[['requirement']].applymap(lambda text: BeautifulSoup(text, 'html.parser').get_text())
+    
+    #Define unvaluable words
+    stop_words = set(stopwords.words('english'))
+    unvaluable_words = ['others', 'etc', 'years' , 'minimum', 'bachelor', 'degree', 'experience', 'least', 'candidate', 'diploma', 'required', 'must', 'possess', 'year', 'along', 'willing', 'month', 'related', 'able', 'months']
+    
+    
+    #Define function for text cleanup
+    def pre_process(text):
+        
+        #Convert to lowercase
+        text = text.lower()
+        
+        #Remove tags
+        text = re.sub("&lt;/?.*?&gt;"," &lt;&gt; ",text)
+        
+        #Remove special characters and digits
+        text = re.sub("(\\d|\\W)+"," ",text)
+        
+        #Convert from list to string
+        text = text.split()
+        
+        #Remove unvaluable words
+        text = [word for word in text if word not in stop_words]
+        text = [word for word in text if word not in unvaluable_words]
+        
+        #Remove short words (less than three letters) as they are likely unvaluable
+        text = [word for word in text if len(word) > 2]
+        
+        return ' '.join(text)
+    
+    #Create new columns containing jobDesc and requirements after filtered to remove unvaluable words
+    jobs['jobDesc keyword'] = jobs['jobDesc'].apply(lambda text: pre_process(text))
+    jobs['requirement keyword'] = jobs['requirement'].apply(lambda text: pre_process(text))
+    
+    #Convert the table 'jobs' to include open jobs only
+    open_is_true = jobs['status'] == 'OPEN'
+    openjobs = jobs[open_is_true]
+    
+    #Combine columns 'jobDesc keywords' and 'requirement keywords' to create a new column 'combined keywords'
+    openjobs['combined_keywords'] = openjobs['jobDesc keyword'] + ' ' + openjobs['requirement keyword']
+    
+    #Select relevant columns and reset index
+    job_column = ['_id', 'title', 'categories', 'combined_keywords']
+    openjobs = openjobs[job_column]
+    openjobs = openjobs.reset_index(drop = True)
+    
+    #(Left) merge 'skills' and 'personal' dataframes
+    skills = skills.merge(personal, left_on = 'employee_id', right_on = 'badge', how = 'left')
+    
+    #Filter for active employees only
+    active_employees = skills['status'] == 'ACTIVE'
+    skills = skills[active_employees]
+    
+    #Filter for approved skills only
+    approved = skills['process'] == 'approved'
+    approved_skills = skills[approved]
+    
+    #Filter for recent skills only (less than 3 years/1095 days)
+    recent = approved_skills.timestamp > datetime.datetime.now() - pd.to_timedelta("1095 days")
+    approved_skills = approved_skills[recent]
+    
+    #Convert column data type to string
+    approved_skills['competency'] = approved_skills['competency'].astype(str)
+    approved_skills['competency_category'] = approved_skills['competency_category'].astype(str)
+    approved_skills['remarks'] = approved_skills['remarks'].astype(str)
+    
+    #Combine category, competency, and remarks into a single column
+    approved_skills['combined_skills'] = approved_skills['competency_category'] + " " + approved_skills['competency'] + " " + approved_skills['remarks']
+    
+    #Select valuable columns
+    columns = ['employee_id', 'nama', 'email', 'combined_skills']
+    approved_skills = approved_skills[columns]
+    approved_skills.rename(columns = {'nama':'name'}, inplace = True)
+    
+    #Group by employee_id to remove duplicates
+    approved_skills = approved_skills.groupby("employee_id").agg(combined_skills=("combined_skills", ','.join)).reset_index()
+    
+    #Filter 'combined_skills' column to remove unvaluable words
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].apply(lambda text: pre_process(text))
+    
+    #Combine 2-word keywords to prepare for text analysis
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.lower()
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.replace("project management", "projectmanagement")
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.replace("human resource", "humanresource")
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.replace("big data", "bigdata")
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.replace("data visualization", "datavisualization")
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.replace("ux design", "uxdesign")
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.replace("data center", "datacenter")
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.replace("data analysis", "dataanalysis")
+    approved_skills['combined_skills'] = approved_skills['combined_skills'].str.replace("gap analysis", "gapanalysis")
+    
+    #Format selcted job data to be added to 'approved skills' table for analysis
+    selected_job = openjobs[openjobs['_id'] == job_id]
+    columns = ['_id', 'combined_keywords']
+    selected_job = selected_job[columns]
+    selected_job.columns = ['employee_id','combined_skills']
+    
+    #Adding selected job data to approved skills dataframe
+    approved_skills = pd.concat([approved_skills, selected_job], ignore_index=True)
+    
+    #Set employee id as index
+    approved_skills.set_index('employee_id', inplace=True)
+    
+    #Combined skills vectorizing
+    tf = TfidfVectorizer(analyzer='word', ngram_range=(1, 3), min_df=0.01)
+    tfidf_skills = tf.fit_transform(approved_skills['combined_skills'])
+    
+    #Calculating cosine similarity
+    cos_sim = cosine_similarity(tfidf_skills, tfidf_skills)
+    
+    #Set index
+    indices = pd.Series(approved_skills.index)
+    
+    #Create model to return top 3 recommendation based on cosine similarity
+    def recommendations(job_id, cos_sim = cos_sim):
+
+        recommended_employee = []
+
+        #Obtain index of job
+        idx = indices[indices == job_id].index[0]
+
+        #Create series of cosine similarities of individual skills_keywords and job_keywords and sort them
+        score_series = pd.Series(cos_sim[idx]).sort_values(ascending = False)
+
+        #Take the index of the 3 with the greatest cosine similarities
+        top_3_indexes = list(score_series.iloc[1:4].index)
+
+        #Put the employee_id of the 3 employees into a list
+        for i in top_3_indexes:
+            recommended_employee.append(list(approved_skills.index)[i])
+
+        return recommended_employee
+    
+    return recommendations(job_id)
